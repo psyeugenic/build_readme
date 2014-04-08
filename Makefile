@@ -1,6 +1,6 @@
 REBAR=./rebar
 
-build_readme: $(REBAR) src/build_readme.erl src/git.erl src/system.erl
+build_readme: $(REBAR) src/build_readme.erl src/git.erl src/system.erl src/tickets.erl
 	$(REBAR) compile
 	$(REBAR) escriptize
 

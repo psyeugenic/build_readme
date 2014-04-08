@@ -1,3 +1,4 @@
 rebar
 ebin/
 build_readme
+*.sw[a-z]
