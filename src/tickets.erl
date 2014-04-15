@@ -7,8 +7,10 @@
 %%
 
 -module(tickets).
--export([test/0,context/1,from_id/2]).
+-export([context/1,from_id/2,from_version/2,load_mapping/1]).
+-export([test/0,test_format/0,strip/1,to_version/1]).
 -record(ctx,{
+	mapping=gb_trees:empty(),
 	path="."
     }).
 -include_lib("build_readme/include/tickets.hrl").
@@ -17,20 +19,13 @@
 context([]) -> context([{path,"/home/otp/TICKETS"}]);
 context([{path,Path}]) ->
     #ctx{
+	mapping=gb_trees:empty(),
 	path=Path
     }.
 
 from_id(<<"OTP-",_/binary>>=Id, #ctx{path=Path}) ->
     {ok,Bin} = file:read_file(filename:join([Path,Id])),
     parse_ticket(binary:split(Bin,[<<"\n">>], [global]),#ticket{id=Id}).
-
-%parse_ticket([],Ticket) -> Ticket;
-%parse_ticket([Line|Lines], T0) ->
-%    case line(Line,T0) of
-%	{done,T1} -> T1;
-%	T1 -> parse_ticket(Lines, T1)
-%    end.
-%
 
 parse_ticket(Lines,#ticket{}=T) ->
     %% two iterations,
@@ -146,8 +141,7 @@ line(<<>>) -> {value, <<"\n">>};
 line(<<"--------------------------- OTP Ticket -",_/binary>>) -> ignore;
 line(<<"----------------------------------------",_/binary>>) -> ignore;
 
-line(B) ->
-    {value, B}.
+line(B) -> {value, <<B/binary,"\n">>}.
 
 %% aux
 %%
@@ -189,10 +183,6 @@ to_boolean(<<"No",_/binary>>) -> false;
 to_boolean(<<"false",_/binary>>) -> false;
 to_boolean(<<"-">>) -> false;
 to_boolean(<<"\"\"">>) -> false;
-%to_boolean(<<"Yes",_/binary>>) -> true;
-%to_boolean(<<"yes",_/binary>>) -> true;
-%to_boolean(<<"ja",_/binary>>) -> true;
-%to_boolean(<<"TBD",_/binary>>) -> true;
 to_boolean(_) -> true. %% srsly, wtf
 
 to_status(<<"new">>=V) -> V;
@@ -324,18 +314,13 @@ to_application(<<"doc">>) -> <<"documentation">>;
 to_application(<<"Docu",_/binary>>) -> <<"documentation">>;
 to_application(App) -> App.
 
-to_assigned_to(V) ->
-    %io:format("~p~n", [V]),
-    V.
+to_assigned_to(V) -> V.
 
-to_created_by(V) ->
-    %io:format("~p~n", [V]),
-    V.
+to_created_by(V) -> V.
 
 to_fixed_in(V) ->
     [to_version(Vsn) || Vsn <- split(V)].
 
-to_version(<<"erl_",_/binary>>=Patch) -> Patch;
 to_version(AppVsn) ->
     case [Item || Item <- binary:split(AppVsn,<<"-">>,[global]),Item =/= <<>>] of
 	[<<"C">>,App0,Vsn] ->
@@ -361,10 +346,42 @@ to_author_datetime(V) ->
 	    {<<>>,<<>>}
     end.
 
+load_mapping(#ctx{ path=Path }=Ctx) ->
+    {ok,Ls} = file:list_dir(Path),
+    load_mapping(Ls,Ctx).
+
+load_mapping([],Ctx) -> Ctx;
+load_mapping(["OTP-" ++ _ =OTP|Ids],#ctx{ mapping = M0 }=Ctx) ->
+    Id = list_to_binary(OTP),
+    #ticket{ fixed_in=Rels } = from_id(Id,Ctx),
+    M = lists:foldl(fun(AppVsn,Mi) ->
+		case gb_trees:lookup(AppVsn,Mi) of
+		    none -> gb_trees:enter(AppVsn, [Id], Mi);
+		    {value,Vs} -> gb_trees:enter(AppVsn,[Id|Vs],Mi)
+		end
+	end,M0,Rels),
+    load_mapping(Ids,Ctx#ctx{ mapping=M });
+load_mapping([_|Ids],Ctx) ->
+    load_mapping(Ids,Ctx).
+   
+
+from_version(Vsn,#ctx{mapping=M}) ->
+    case gb_trees:lookup(Vsn,M) of
+	none -> [];
+	{value,Vs} -> Vs
+    end.
+
 %% test
 
 test() ->
     Ctx = #ctx{path=Path} = context([]),
     {ok,Ls} = file:list_dir(Path),
+
     _ = [from_id(list_to_binary(Id),Ctx)|| "OTP-"++_ = Id <- Ls],
+    ok.
+test_format() ->
+    Ctx = #ctx{path=Path} = context([]),
+    {ok,Ls} = file:list_dir(Path),
+    Ts = [from_id(list_to_binary(Id),Ctx)|| "OTP-"++_ = Id <- Ls],
+    _ = [ _ = [readme_layout:from_release_note(B)] ||#ticket{ release_note=B }<-Ts],
     ok.

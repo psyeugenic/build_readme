@@ -6,15 +6,20 @@
 
 -module(build_readme).
 
--export([
-	main/1
-    ]).
+-export([main/1]).
 
 -include_lib("build_readme/include/git.hrl").
+-include_lib("build_readme/include/tickets.hrl").
+
+-record(versions,{
+	otp = <<>>,
+	applications = []
+    }).
 
 -record(opts, {
 	range = "HEAD",
 	repo = ".",
+	upcoming,
 	stats = lines, %% none | percent | lines
 	maxlen = 0, %% topic length in output
 	filter = [
@@ -26,9 +31,10 @@
     }).
 
 
-parse_opts([], Opts) -> Opts;
+parse_opts(["-h"], _Opts) -> usage();
 parse_opts(["-s="++Type|Args],Opts) -> parse_opts(Args,Opts#opts{ stats = list_to_atom(Type) });
 parse_opts(["-r="++Repo|Args],Opts) -> parse_opts(Args,Opts#opts{ repo=Repo });
+parse_opts(["-versions="++File|Args], Opts) -> parse_opts(Args,Opts#opts{ upcoming=File });
 parse_opts(["-filter="++Filter|Args],Opts) ->
     parse_opts(Args,Opts#opts{
 	    filter = [list_to_binary(F)||F <- string:tokens(Filter,",")]
@@ -37,108 +43,157 @@ parse_opts(["-"++Opt|_],_) -> erlang:error({unrecognized_option, Opt});
 parse_opts([To],Opts) -> Opts#opts{ range = To ++ "..HEAD" };
 parse_opts([To,From],Opts) -> Opts#opts{ range = To ++ ".." ++From }.
 
+usage() ->
+    io:put_chars([
+	    "build_readme [-h] [-s=<stats>] [-r=<repository>] [-filter=<branches>] <to> [<from>]\n",
+	    "\n"
+	    "    -s=<stats> :: none | percent | line, line is default\n"
+	    "    -r=<repository> :: path(), . is default\n",
+	    "    -filter=<branches> :: branch1,branch2,.. : branches that should be not included in the readme\n"
+	    "    -h   this usage text\n"
+	]).
+
+main([]) -> usage();
 main(Args) ->
     try
 	Opts = parse_opts(Args,#opts{}),
-	dump(collect(parse_opts(Args,Opts)),Opts)
+	Topics = topics(Opts),
+	TopicTree = ticket_tree_from_topics(Topics),
+	Vsns = upcoming_versions(Opts),
+	VsnTree = ticket_tree_from_versions(Vsns),
+	%{Items,_Ws} = aggregate(VsnTree,TopicTree),
+	dump_versions(VsnTree),
+	%dump(Items),
+	ok
     catch 
 	E:R ->
 	    system:format_error(E,R)
     end.
 
-collect(#opts{ repo=Repo, range=Range, filter=Filter }) ->
+topics(#opts{ repo=Repo, range=Range, filter=Filter }) ->
     Branches = git:get_branches(Repo, Range, Filter),
-    Topics = git:get_topics(Repo, Branches),
-    %git:check_topics(Repo,Topics,Range),
-    Topics.
+    git:get_topics(Repo, Branches).
 
-dump(Topics,Opts) ->
-    MaxLen = lists:foldl(fun
-	    (#topic{name=Name},Len) ->
-		max(Len,byte_size(Name))
-	end, 0, Topics),
-    io:put_chars(topics(Topics,Opts#opts{maxlen=MaxLen})).
+ticket_tree_from_topics(Topics) ->
+    lists:foldl(fun(#topic{tickets=Tickets}=Topic,Ti1) ->
+		lists:foldl(fun(Id,Ti2) ->
+			    case gb_trees:lookup(Id,Ti2) of
+				none -> gb_trees:enter(Id,[Topic],Ti2);
+				{value,Vs} -> gb_trees:enter(Id,[Topic|Vs],Ti2)
+			    end
+		    end, Ti1,Tickets)
+	end, gb_trees:empty(), Topics).
 
-topics([],_) -> [];
-topics([T|Ts],Opts) -> [topic(T,Opts)|topics(Ts,Opts)].
+ticket_tree_from_versions(#versions{otp=Otp,applications=Apps}) ->
+    ticket_tree_from_versions([Otp|lists:sort(Apps)]);
+ticket_tree_from_versions(Vsns) ->
+    Ctx0 = tickets:context([]),
+    Ctx1 = tickets:load_mapping(Ctx0),
+    ticket_tree_from_versions(Vsns,Ctx1,gb_trees:empty()).
 
-topic(#topic{
-	name = Name,
-	merged_by={Committer,_,When},
-	tickets = Tickets,
-	applications=Apps
-    }=Topic,#opts{maxlen=Len}=Opts) ->
-    Preamble = header(Len,""),
-    [
-	spaces(Len-byte_size(Name)), Name, " | merged by ", s(Committer), ", ",When, "\n",
-	header(Len,"applications:"), format_applications(Preamble,Apps), "\n",
-	header(Len,"tickets:"), format_applications(Preamble,Tickets), "\n",
-	header(Len,"authors:"), format_authors(Preamble,authors_from_topic(Topic),Opts), "\n",
-	header(Len,"subjects:"), format_subjects(Preamble,subjects_from_topic(Topic)), "\n",
-	"\n"
-    ].
+ticket_tree_from_versions([],_,T) -> T;
+ticket_tree_from_versions([Vsn|Vsns],Ctx,T) ->
+    T1 = lists:foldl(fun(Id,Ti1) ->
+		case gb_trees:lookup(Id,Ti1) of
+		    none -> gb_trees:enter(Id,tickets:from_id(Id,Ctx),Ti1);
+		    {value,_} -> Ti1
+		end
+	end,T,tickets:from_version(Vsn,Ctx)),
+    ticket_tree_from_versions(Vsns,Ctx,T1).
 
-format_authors(P,Authors,Opts) ->
-    Ds = [D||{_Name,{_A,D}}<-Authors],
-    As = [A||{_Name,{A,_D}}<-Authors],
-    format_authors(P,Authors,{lists:sum(As),lists:sum(Ds)},Opts).
-format_authors(_,[],_,_) -> [];
-format_authors(_,[Author],T,Opts) ->
-    [format_author(Author,T,Opts)];
-format_authors(P,[Author|Authors],T,Opts) ->
-    A = format_author(Author,T,Opts),
-    [A,"\n",P|format_authors(P,Authors,T,Opts)].
+ 
+%% upcoming versions
+upcoming_versions(#opts{upcoming=File}) when is_list(File) ->
+    {ok,B}=file:read_file(File),
+    lists:foldl(fun
+	    (<<>>,V) -> V;
+	    (<<"#",_/binary>>, V) -> V;
+	    (<<"otp-",_/binary>>=Otp,V) ->
+		V#versions{ otp=Otp };
+	    (AppVsn,#versions{ applications = Apps }=V) ->
+		V#versions{ applications = [tickets:to_version(AppVsn)|Apps] }
+	end,#versions{},binary:split(B, [<<"\n">>], [global])).
 
-format_author({Name,{A,D}},{Ta,Td},#opts{stats=Type}) ->
-    case {Type,Ta+Td} of
-	{lines, _} ->
-	    io_lib:format("~s (~w lines)", [Name,A+D]);
-	{percent, N} when N > 0 ->
-	    R = (A+D)/(N),
-	    io_lib:format("~s (~.2f %)", [Name,R*100]);
-	_ ->
-	    io_lib:format("~s", [Name])
-    end.
-
-format_applications(P,Apps) ->
-    format_applications(P,Apps,0,70).
-format_applications(_,[],_,_) -> [];
-format_applications(_,[App],_,_) -> [App];
-format_applications(P,[App|Apps],I,N) when 1+byte_size(App) + I < N ->
-    [App,", "|format_applications(P,Apps,2 + I+byte_size(App),N)];
-format_applications(P,[App|Apps],_,N) ->
-    [App,",\n",P|format_applications(P,Apps,0,N)].
+-record(item,{
+	%% from git
+	merged_by=[],
+	authors = [],
+	%% from ticket
+	applications=[],
+	release_note= <<>>
+    }).
 
 
-format_subjects(_,[]) -> [];
-format_subjects(P,[T]) -> ["* ",format_subject(P,T)];
-format_subjects(P,[T|Ts]) ->
-    ["* ",format_subject(P,T),"\n",P|format_subjects(P,Ts)].
+dump_versions(VsnTree) ->
+    Ts = gb_trees:keys(VsnTree),
+    Ctx = tickets:context([]),
+    S = dump_versions(Ts,Ctx),
+    file:write_file("wat.md", iolist_to_binary(S)),
+    ok.
 
-format_subject(P,S) ->
-    N = byte_size(S),
-    Limit = 72,
-    case N < Limit of
-	true -> S;
-	false ->
-	    Bs = binary:split(S,<<" ">>, [global]),
-	    {Txt,_}=lists:mapfoldl(fun
-		    (B,I) when I + byte_size(B) < Limit -> 
-			{[B, <<" ">>], I + byte_size(B)};
-		    (B,_) ->
-			{["\n",P,<<"  ">>, B, <<" ">>],byte_size(B) + 1}
-		end, 0, Bs),
-	    Txt
+dump_versions([],_) -> [];
+dump_versions([T|Ts],Ctx) ->
+    case tickets:from_id(T,Ctx) of
+	#ticket{ status=Status } when Status =:= <<"cancelled">> ->
+	    %% check not merged
+	    dump_versions(Ts,Ctx);
+	#ticket{ type=Type } when Type =:= <<"job">> ->
+	    dump_versions(Ts,Ctx);
+	#ticket{release_note=Note} ->
+	    Nl = readme_layout:from_release_note(Note),
+	    [readme_layout:format(
+		    readme_layout:header(T,Nl)
+		)|dump_versions(Ts,Ctx)]
     end.
 
 
+aggregate(VsnTree,TopicTree) ->
+    %% collect all tickets
+    Tickets = lists:usort(gb_trees:keys(VsnTree) ++ gb_trees:keys(TopicTree)),
+    aggregate(Tickets,VsnTree,TopicTree,[],[]).
 
+aggregate([],_,_,Res,Ws) -> {Res,Ws};
+aggregate([Id|Ids],Vt,Tt,Res,Ws) ->
+    case gb_trees:lookup(Id,Vt) of
+	none ->
+	    aggregate(Ids,Vt,Tt,Res,[{Id,no_version}|Ws]);
 
+	{value, Ticket} ->
+	    case Ticket of
+		#ticket{ status=Status } when Status =:= <<"cancelled">> ->
+		    %% check not merged
+		    aggregate(Ids,Vt,Tt,Res,Ws);
+		#ticket{ type=Type } when Type =:= <<"job">> ->
+		    %% check if release note exists
+		    aggregate(Ids,Vt,Tt,Res,Ws);
+		Ticket ->
+		    Item = aggregate_item(Ticket,Tt),
+		    aggregate(Ids,Vt,Tt,[{Id,Item}|Res],Ws)
+	    end
+    end.
 
-subjects_from_topic(#topic{commits=Cs}) ->
-    [Subject||#commit{subject=Subject} <- Cs].
+aggregate_item(#ticket{ id=Id,fixed_in=Apps,release_note=Note },Tt) ->
+    case gb_trees:lookup(Id,Tt) of
+	none -> #item{
+		applications=Apps,
+		release_note=Note
+	    };
+	{value, Topics} ->
+	    Merger = lists:usort([merger_from_topic(Topic)||Topic<-Topics]),
+	    Authors = lists:usort(lists:flatten(
+		    [[Name||{Name,_}<-authors_from_topic(Topic)]||Topic<-Topics]
+		)),
+	    #item{
+		applications=Apps,
+		release_note=Note,
+		merged_by=Merger,
+		authors=Authors
+	    }
+    end.
 
-authors_from_topic(#topic{ commits = Cs }) ->
+merger_from_topic(#topic{ merged_by={Name,_,_} }) -> Name.
+
+authors_from_topic(#topic{ commits=Cs }) ->
     authors_from_commits(Cs).
 
 authors_from_commits(Cs) -> 
@@ -152,10 +207,44 @@ authors_from_commits([#commit{author={Name,_,_},stats={{A,D},_}}|Cs],T) ->
     end,
     authors_from_commits(Cs,T1).
 
-header(Len,Topic) ->
-    [spaces(Len), format(" | ~13s ", [Topic])].
+
+%% debug
+dump(Items) ->
+    file:write_file("wat.md",list_to_binary(dump_items(Items))).
+
+dump_items([]) -> [];
+dump_items([{Id,#item{
+	authors=Authors,
+	applications=Apps,
+	merged_by=Merger,
+	release_note=Note}}|Items]) ->
+    [[
+	    "### ",Id," ###\n",
+	    "* Authors: ", join(lists:sort(Authors),", "), "\n",
+	    "* Applications: ", join(lists:sort(Apps),", "), "\n",
+	    "\n",
+	    format_note(Note),
+	    "\n","\n"
+
+    ] | dump_items(Items)].
 
 
-format(F,Ts) -> io_lib:format(F,Ts).
-s(T) -> format("~s",[T]).
-spaces(N) -> lists:duplicate(N, 32).
+join([],_) -> [];
+join([I],_) -> [I];
+join([I|Is],Sep) -> [[I,Sep]|join(Is,Sep)].
+
+format_note(Note0) ->
+    Note1 = re:replace(Note0,<<"<c>">>,<<"`">>,[global]),
+    Note  = iolist_to_binary(re:replace(iolist_to_binary(Note1),<<"</c>">>,<<"`">>,[global])),
+    Ws = [W||W <- binary:split(Note,[<<"\n">>,<<"\t">>,<<" ">>,<<"\n">>],[global]), W =/= <<>>],
+    format_note_1(Ws,75).
+
+format_note_1([],_) -> [];
+format_note_1([W|Ws],N) ->
+    Len = byte_size(W),
+    if
+	N - Len < 0 ->
+	    [<<"\n">>,W|format_note_1(Ws,75)];
+	true ->
+	    [W,<<" ">>|format_note_1(Ws,N-byte_size(W))]
+    end.
